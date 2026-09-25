@@ -15,6 +15,7 @@ from pyspark.sql.types import (
     IntegerType, LongType,
     TimestampType
 )
+from pyspark.sql.functions import pandas_udf, col
 
 from kafka import KafkaProducer
 from prometheus_client import (
@@ -69,8 +70,8 @@ POSTGRES_USER      = os.getenv('POSTGRES_USER', 'fraud_user')
 POSTGRES_PASSWORD  = os.getenv('POSTGRES_PASSWORD', 'fraud_pass')
 
 # ── FEATURE COLUMNS ───────────────────────────────────────────
-V_FEATURES    = [f'V{i}' for i in range(1, 29)]
-ALL_FEATURES  = ['Time', 'Amount'] + V_FEATURES  # 30 features
+V_FEATURES   = [f'V{i}' for i in range(1, 29)]
+ALL_FEATURES = ['Time'] + V_FEATURES + ['Amount'] # 30 features
 
 # ── PROMETHEUS METRICS ────────────────────────────────────────
 transactions_processed = Counter(
@@ -120,8 +121,9 @@ kafka_alert_errors = Counter(
 # ════════════════════════════════════════════════════════════════
 class ModelManager:
     """
-    Loads and manages the ML model
-    Designed to be serializable for Spark broadcast
+    Loads and manages the ML model.
+    Used on the driver to load model once,
+    then contents are broadcast to workers.
     """
 
     def __init__(self, model_path: str, scaler_path: str):
@@ -137,24 +139,6 @@ class ModelManager:
         self._scaler = joblib.load(self.scaler_path)
         log.info("✅ Model loaded successfully")
         return self
-
-    def predict(self, features_df: pd.DataFrame) -> np.ndarray:
-        """
-        Run inference on a batch of transactions
-        Returns array of fraud probabilities
-        """
-        # Scale Amount and Time
-        features_df = features_df.copy()
-        features_df[['Amount', 'Time']] = self._scaler.transform(
-            features_df[['Amount', 'Time']]
-        )
-
-        # Predict probabilities
-        probabilities = self._model.predict_proba(
-            features_df[ALL_FEATURES]
-        )[:, 1]  # index 1 = fraud class
-
-        return probabilities
 
 
 # ════════════════════════════════════════════════════════════════
@@ -336,15 +320,15 @@ class AlertProducer:
         """Send fraud alert to Kafka topic"""
         try:
             alert = {
-                'alert_id'        : f"ALERT-{time.time_ns()}",
-                'transaction_id'  : transaction['transaction_id'],
-                'timestamp'       : time.time(),
+                'alert_id'         : f"ALERT-{time.time_ns()}",
+                'transaction_id'   : transaction['transaction_id'],
+                'timestamp'        : time.time(),
                 'fraud_probability': transaction['fraud_probability'],
-                'amount'          : transaction['amount'],
-                'merchant_id'     : transaction['merchant_id'],
-                'country'         : transaction['country'],
-                'card_last_four'  : transaction['card_last_four'],
-                'severity'        : self._get_severity(
+                'amount'           : transaction['amount'],
+                'merchant_id'      : transaction['merchant_id'],
+                'country'          : transaction['country'],
+                'card_last_four'   : transaction['card_last_four'],
+                'severity'         : self._get_severity(
                     transaction['fraud_probability']
                 )
             }
@@ -370,8 +354,8 @@ class AlertProducer:
 # ════════════════════════════════════════════════════════════════
 def get_transaction_schema() -> StructType:
     """
-    Define the schema for messages coming from Kafka
-    Spark uses this to parse JSON efficiently
+    Define the schema for messages coming from Kafka.
+    Spark uses this to parse JSON efficiently.
     """
     v_fields = [
         StructField(f'V{i}', DoubleType(), True)
@@ -407,7 +391,6 @@ def get_transaction_schema() -> StructType:
 def create_spark_session() -> SparkSession:
     """Create and configure Spark session"""
 
-    # JAR files for Kafka connector
     jars = ','.join([
         '/app/spark-sql-kafka.jar',
         '/app/kafka-clients.jar',
@@ -419,28 +402,18 @@ def create_spark_session() -> SparkSession:
         SparkSession.builder
         .appName('FraudDetectionStreaming')
         .config('spark.jars', jars)
-
-        # Streaming configs
         .config('spark.streaming.stopGracefullyOnShutdown', 'true')
         .config('spark.sql.streaming.checkpointLocation',
                 '/tmp/spark-checkpoints')
-
-        # Performance configs
         .config('spark.sql.shuffle.partitions', '4')
         .config('spark.default.parallelism', '4')
-
-        # Memory configs
         .config('spark.driver.memory', '2g')
         .config('spark.executor.memory', '2g')
-
-        # Log level
         .config('spark.ui.enabled', 'true')
         .config('spark.ui.port', '4040')
-
         .getOrCreate()
     )
 
-    # Reduce Spark's verbose logging
     spark.sparkContext.setLogLevel('WARN')
 
     log.info("✅ Spark session created")
@@ -451,84 +424,211 @@ def create_spark_session() -> SparkSession:
 
 
 # ════════════════════════════════════════════════════════════════
-# BATCH PROCESSOR
+# PANDAS UDF FACTORY
 # ════════════════════════════════════════════════════════════════
-def process_batch(batch_df, batch_id: int,
-                  model_manager: ModelManager,
-                  db_manager: DatabaseManager,
-                  alert_producer: AlertProducer):
+def make_fraud_udf(model_broadcast):
     """
-    Called by Spark for each micro-batch
-    This is where the ML scoring happens
+    Returns a Pandas UDF that runs XGBoost inference.
+    Wraps the broadcast so workers access their local
+    cached copy instead of reloading from disk each call.
+    """
 
-    batch_df  → Spark DataFrame with transactions from Kafka
-    batch_id  → incrementing batch number
+    @pandas_udf(DoubleType())
+    def predict_fraud_proba(
+        time   : pd.Series,
+        amount : pd.Series,
+        v1     : pd.Series, v2 : pd.Series, v3 : pd.Series,
+        v4     : pd.Series, v5 : pd.Series, v6 : pd.Series,
+        v7     : pd.Series, v8 : pd.Series, v9 : pd.Series,
+        v10    : pd.Series, v11: pd.Series, v12: pd.Series,
+        v13    : pd.Series, v14: pd.Series, v15: pd.Series,
+        v16    : pd.Series, v17: pd.Series, v18: pd.Series,
+        v19    : pd.Series, v20: pd.Series, v21: pd.Series,
+        v22    : pd.Series, v23: pd.Series, v24: pd.Series,
+        v25    : pd.Series, v26: pd.Series, v27: pd.Series,
+        v28    : pd.Series
+    ) -> pd.Series:
+
+        # Each worker reads from its local broadcast cache
+        model  = model_broadcast.value['model']
+        scaler = model_broadcast.value['scaler']
+
+        # Rebuild feature DataFrame on the worker
+        features = pd.DataFrame({
+            'Time'  : time,   'Amount': amount,
+            'V1'    : v1,     'V2'    : v2,
+            'V3'    : v3,     'V4'    : v4,
+            'V5'    : v5,     'V6'    : v6,
+            'V7'    : v7,     'V8'    : v8,
+            'V9'    : v9,     'V10'   : v10,
+            'V11'   : v11,    'V12'   : v12,
+            'V13'   : v13,    'V14'   : v14,
+            'V15'   : v15,    'V16'   : v16,
+            'V17'   : v17,    'V18'   : v18,
+            'V19'   : v19,    'V20'   : v20,
+            'V21'   : v21,    'V22'   : v22,
+            'V23'   : v23,    'V24'   : v24,
+            'V25'   : v25,    'V26'   : v26,
+            'V27'   : v27,    'V28'   : v28,
+        })
+
+        # Fix: scale both columns together with one transform
+        features[['Amount', 'Time']] = scaler.transform(
+            features[['Amount', 'Time']]
+        )
+
+        probabilities = model.predict_proba(
+            features[ALL_FEATURES]
+        )[:, 1]
+
+        return pd.Series(probabilities)
+
+    return predict_fraud_proba
+
+
+# ════════════════════════════════════════════════════════════════
+# STREAMING SETUP
+# ════════════════════════════════════════════════════════════════
+def run_streaming_with_udf(spark, model_broadcast,
+                            db_manager, alert_producer):
+    """
+    Builds the streaming pipeline.
+    UDF handles inference distributed across workers.
+    foreachBatch only handles I/O (DB + Kafka alerts).
+    """
+
+    schema    = get_transaction_schema()
+    fraud_udf = make_fraud_udf(model_broadcast)
+
+    # ── READ FROM KAFKA ───────────────────────────────────────
+    raw_stream = (
+        spark.readStream
+        .format('kafka')
+        .option('kafka.bootstrap.servers', KAFKA_BOOTSTRAP_SERVERS)
+        .option('subscribe', KAFKA_TOPIC_INPUT)
+        .option('startingOffsets', 'latest')
+        .option('maxOffsetsPerTrigger', 10000)
+        .option('failOnDataLoss', 'false')
+        .load()
+    )
+
+    # ── PARSE JSON ────────────────────────────────────────────
+    parsed_stream = (
+        raw_stream
+        .select(
+            F.from_json(
+                F.col('value').cast('string'),
+                schema
+            ).alias('data'),
+            F.col('timestamp').alias('kafka_timestamp'),
+            F.col('partition'),
+            F.col('offset')
+        )
+        .select('data.*', 'kafka_timestamp', 'partition', 'offset')
+        .filter(F.col('transaction_id').isNotNull())
+    )
+
+    # ── APPLY UDF (distributed inference) ────────────────────
+    # Scoring happens here on workers, NOT in foreachBatch
+    scored_stream = (
+        parsed_stream
+        .withColumn(
+            'fraud_probability',
+            fraud_udf(
+                col('Time'),  col('Amount'),
+                col('V1'),    col('V2'),    col('V3'),
+                col('V4'),    col('V5'),    col('V6'),
+                col('V7'),    col('V8'),    col('V9'),
+                col('V10'),   col('V11'),   col('V12'),
+                col('V13'),   col('V14'),   col('V15'),
+                col('V16'),   col('V17'),   col('V18'),
+                col('V19'),   col('V20'),   col('V21'),
+                col('V22'),   col('V23'),   col('V24'),
+                col('V25'),   col('V26'),   col('V27'),
+                col('V28')
+            )
+        )
+        .withColumn(
+            'is_fraud_predicted',
+            F.col('fraud_probability') >= FRAUD_THRESHOLD
+        )
+    )
+
+    log.info("✅ Stream + UDF pipeline defined")
+    log.info(f"   Batch interval  : {BATCH_INTERVAL} seconds")
+    log.info(f"   Fraud threshold : {FRAUD_THRESHOLD}")
+
+    # ── START STREAMING QUERY ─────────────────────────────────
+    query = (
+        scored_stream.writeStream
+        .foreachBatch(
+            lambda df, batch_id: process_batch_udf(
+                df, batch_id, db_manager, alert_producer
+            )
+        )
+        .trigger(processingTime=f'{BATCH_INTERVAL} seconds')
+        .option(
+            'checkpointLocation',
+            '/tmp/spark-checkpoints/fraud-streaming'
+        )
+        .start()
+    )
+
+    return query
+
+
+# ════════════════════════════════════════════════════════════════
+# BATCH PROCESSOR  (I/O only — no inference here)
+# ════════════════════════════════════════════════════════════════
+def process_batch_udf(batch_df, batch_id: int,
+                      db_manager: DatabaseManager,
+                      alert_producer: AlertProducer):
+    """
+    Called by Spark for each micro-batch.
+    Inference already done by UDF on workers.
+    This function only handles:
+      - Prometheus metrics update
+      - Fraud alerts → Kafka
+      - All transactions → PostgreSQL
     """
     batch_start = time.time()
 
-    # Skip empty batches
     if batch_df.isEmpty():
         log.debug(f"Batch {batch_id}: empty, skipping")
         return
 
-    # Convert Spark DataFrame → Pandas
-    # (needed for XGBoost inference)
-    pdf = batch_df.toPandas()
+    # Small collect to driver — only for I/O, not for inference
+    pdf        = batch_df.toPandas()
     batch_size = len(pdf)
 
-    log.info(
-        f"\n{'='*50}\n"
-        f"📦 Batch {batch_id} | Size: {batch_size} transactions"
-    )
-
-    # ── ML INFERENCE ──────────────────────────────────────────
-    inference_start = time.time()
-
-    try:
-        fraud_probabilities = model_manager.predict(
-            pdf[ALL_FEATURES]
-        )
-    except Exception as e:
-        log.error(f"❌ Inference error in batch {batch_id}: {e}")
-        return
-
-    inference_elapsed = time.time() - inference_start
-    inference_duration.observe(inference_elapsed)
-
-    # ── ADD PREDICTIONS TO DATAFRAME ──────────────────────────
-    pdf['fraud_probability']  = fraud_probabilities
-    pdf['is_fraud_predicted'] = (
-        fraud_probabilities >= FRAUD_THRESHOLD
-    ).astype(bool)
-    pdf['processing_time_ms'] = inference_elapsed * 1000
-
-    # ── CALCULATE BATCH STATS ─────────────────────────────────
     fraud_count = int(pdf['is_fraud_predicted'].sum())
     fraud_rate  = fraud_count / batch_size if batch_size > 0 else 0
 
-    log.info(f"   Inference time : {inference_elapsed*1000:.1f}ms")
-    log.info(f"   Fraud detected : {fraud_count}/{batch_size} "
-             f"({fraud_rate*100:.2f}%)")
+    log.info(
+        f"\n{'='*50}\n"
+        f"📦 Batch {batch_id} | {batch_size} transactions | "
+        f"{fraud_count} fraud ({fraud_rate*100:.2f}%)"
+    )
 
-    # ── UPDATE PROMETHEUS ──────────────────────────────────────
+    # ── PROMETHEUS ────────────────────────────────────────────
     transactions_processed.inc(batch_size)
     fraud_detected.inc(fraud_count)
     batch_size_metric.observe(batch_size)
     current_fraud_rate.set(fraud_rate)
 
-    for score in fraud_probabilities:
+    for score in pdf['fraud_probability']:
         fraud_score_distribution.observe(float(score))
 
-    # ── SEND FRAUD ALERTS TO KAFKA ────────────────────────────
+    # ── FRAUD ALERTS → KAFKA ──────────────────────────────────
     fraud_rows = pdf[pdf['is_fraud_predicted'] == True]
     for _, row in fraud_rows.iterrows():
         alert_producer.send_alert({
-            'transaction_id'  : row['transaction_id'],
+            'transaction_id'   : row['transaction_id'],
             'fraud_probability': float(row['fraud_probability']),
-            'amount'          : float(row['Amount']),
-            'merchant_id'     : row['merchant_id'],
-            'country'         : row['country'],
-            'card_last_four'  : row['card_last_four'],
+            'amount'           : float(row['Amount']),
+            'merchant_id'      : row['merchant_id'],
+            'country'          : row['country'],
+            'card_last_four'   : row['card_last_four'],
         })
 
     if fraud_count > 0:
@@ -546,34 +646,34 @@ def process_batch(batch_df, batch_id: int,
                 f"Country: {row['country']}"
             )
 
-    # ── WRITE TO DATABASE ─────────────────────────────────────
-    records = []
-    for _, row in pdf.iterrows():
-        records.append({
-            'transaction_id'      : row['transaction_id'],
-            'amount'              : float(row['Amount']),
-            'fraud_probability'   : float(row['fraud_probability']),
-            'is_fraud_predicted'  : bool(row['is_fraud_predicted']),
+    # ── ALL TRANSACTIONS → POSTGRESQL ─────────────────────────
+    batch_elapsed_ms = (time.time() - batch_start) * 1000
+
+    records = [
+        {
+            'transaction_id'       : row['transaction_id'],
+            'amount'               : float(row['Amount']),
+            'fraud_probability'    : float(row['fraud_probability']),
+            'is_fraud_predicted'   : bool(row['is_fraud_predicted']),
             'is_fraud_ground_truth': int(row['is_fraud_ground_truth']),
-            'merchant_id'         : row['merchant_id'],
-            'card_last_four'      : row['card_last_four'],
-            'country'             : row['country'],
-            'processing_time_ms'  : float(row['processing_time_ms']),
-        })
+            'merchant_id'          : row['merchant_id'],
+            'card_last_four'       : row['card_last_four'],
+            'country'              : row['country'],
+            'processing_time_ms'   : batch_elapsed_ms,
+        }
+        for _, row in pdf.iterrows()
+    ]
 
     db_manager.insert_transactions(records)
 
-    # ── RECORD BATCH METRICS ──────────────────────────────────
-    batch_elapsed    = time.time() - batch_start
-    batch_elapsed_ms = batch_elapsed * 1000
-
-    batch_processing_time.observe(batch_elapsed)
+    # ── BATCH METRICS → POSTGRESQL ────────────────────────────
+    batch_processing_time.observe(batch_elapsed_ms / 1000)
     db_manager.insert_batch_metric(
         batch_id, batch_size, fraud_count, batch_elapsed_ms
     )
 
     log.info(
-        f"   Total batch time: {batch_elapsed_ms:.1f}ms\n"
+        f"   Total batch time : {batch_elapsed_ms:.1f}ms\n"
         f"{'='*50}"
     )
 
@@ -590,7 +690,7 @@ def main():
     start_http_server(PROMETHEUS_PORT)
     log.info(f"📊 Prometheus metrics on port {PROMETHEUS_PORT}")
 
-    # ── LOAD MODEL ────────────────────────────────────────────
+    # ── LOAD MODEL ON DRIVER ──────────────────────────────────
     model_manager = ModelManager(MODEL_PATH, SCALER_PATH).load()
 
     # ── CONNECT TO POSTGRES ───────────────────────────────────
@@ -603,76 +703,22 @@ def main():
     # ── CREATE SPARK SESSION ──────────────────────────────────
     spark = create_spark_session()
 
-    # ── DEFINE SCHEMA ─────────────────────────────────────────
-    schema = get_transaction_schema()
+    # ── BROADCAST MODEL TO ALL WORKERS ───────────────────────
+    # Sent once from driver → cached on each worker in memory
+    # UDF reads from local cache, not from disk
+    model_broadcast = spark.sparkContext.broadcast({
+        'model' : model_manager._model,
+        'scaler': model_manager._scaler,
+    })
+    log.info("📡 Model broadcast to all workers")
 
-    # ── READ STREAM FROM KAFKA ────────────────────────────────
-    log.info(f"📡 Connecting to Kafka topic: {KAFKA_TOPIC_INPUT}")
-
-    raw_stream = (
-        spark.readStream
-        .format('kafka')
-        .option(
-            'kafka.bootstrap.servers',
-            KAFKA_BOOTSTRAP_SERVERS
-        )
-        .option('subscribe', KAFKA_TOPIC_INPUT)
-        .option('startingOffsets', 'latest')
-        .option('maxOffsetsPerTrigger', 10000)
-        .option('failOnDataLoss', 'false')
-        .load()
-    )
-
-    # ── PARSE JSON MESSAGES ───────────────────────────────────
-    # Kafka value is binary → convert to string → parse JSON
-    parsed_stream = (
-        raw_stream
-        .select(
-            F.from_json(
-                F.col('value').cast('string'),
-                schema
-            ).alias('data'),
-            F.col('timestamp').alias('kafka_timestamp'),
-            F.col('partition'),
-            F.col('offset')
-        )
-        .select(
-            'data.*',
-            'kafka_timestamp',
-            'partition',
-            'offset'
-        )
-        # Drop rows with null transaction_id
-        .filter(F.col('transaction_id').isNotNull())
-    )
-
-    log.info("✅ Stream schema defined")
-    log.info(f"   Batch interval: {BATCH_INTERVAL} seconds")
-    log.info(f"   Fraud threshold: {FRAUD_THRESHOLD}")
-
-    # ── START STREAMING QUERY ─────────────────────────────────
-    query = (
-        parsed_stream.writeStream
-        .foreachBatch(
-            lambda df, batch_id: process_batch(
-                df, batch_id,
-                model_manager,
-                db_manager,
-                alert_producer
-            )
-        )
-        .trigger(
-            processingTime=f'{BATCH_INTERVAL} seconds'
-        )
-        .option(
-            'checkpointLocation',
-            '/tmp/spark-checkpoints/fraud-streaming'
-        )
-        .start()
+    # ── BUILD + START STREAMING PIPELINE ─────────────────────
+    query = run_streaming_with_udf(
+        spark, model_broadcast, db_manager, alert_producer
     )
 
     log.info("🚀 Streaming query started")
-    log.info(f"   Query ID: {query.id}")
+    log.info(f"   Query ID : {query.id}")
     log.info("   Waiting for data from Kafka...\n")
 
     # ── WAIT FOR TERMINATION ──────────────────────────────────
