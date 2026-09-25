@@ -32,8 +32,7 @@ y = df['Class']
 # Scale Amount and Time (V1-V28 already scaled by bank)
 scaler = StandardScaler()
 X = X.copy()
-X['Amount'] = scaler.fit_transform(X[['Amount']])
-X['Time']   = scaler.fit_transform(X[['Time']])
+X[['Amount', 'Time']] = scaler.fit_transform(X[['Amount', 'Time']])
 
 print(f"   Features: {len(feature_cols)}")
 print(f"   Feature names: {feature_cols}")
