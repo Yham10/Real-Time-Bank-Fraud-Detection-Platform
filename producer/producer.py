@@ -4,7 +4,6 @@ import time
 import random
 import logging
 import pandas as pd
-import numpy as np
 from kafka import KafkaProducer
 from kafka.errors import NoBrokersAvailable
 from dotenv import load_dotenv
