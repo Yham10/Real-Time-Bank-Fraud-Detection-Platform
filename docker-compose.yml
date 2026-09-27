@@ -1,4 +1,4 @@
-version: '3.8'
+# version: '3.8'
 
 networks:
   fraud-network:
@@ -20,6 +20,9 @@ services:
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - zookeeper-data:/var/lib/zookeeper/data
+      - zookeeper-log:/var/lib/zookeeper/log
     healthcheck:
       test: ["CMD", "nc", "-z", "localhost", "2181"]
       interval: 10s
@@ -217,18 +220,20 @@ services:
       GF_USERS_ALLOW_SIGN_UP: false
       GF_AUTH_ANONYMOUS_ENABLED: true
       GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
-      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: "/var/lib/grafana/dashboards/fraud_dashboard.json"
+      #GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: "/var/lib/grafana/dashboards/fraud_dashboard.json"
     volumes:
       - grafana-data:/var/lib/grafana
       - ./monitoring/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources
       - ./monitoring/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards
-      - ./monitoring/grafana/provisioning/dashboards/fraud_dashboard.json:/var/lib/grafana/dashboards/fraud_dashboard.json
+      # - ./monitoring/grafana/provisioning/dashboards/fraud_dashboard.json:/var/lib/grafana/dashboards/fraud_dashboard.json
     ports:
       - "3000:3000"     # Grafana UI
     restart: unless-stopped
 
 # Add to volumes section (at the bottom of file)
 volumes:
+  zookeeper-data:
+  zookeeper-log:
   kafka-data:
   postgres-data:
   spark-checkpoints:
