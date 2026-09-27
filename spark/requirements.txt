@@ -9,4 +9,4 @@ psycopg2-binary==2.9.7
 sqlalchemy==2.0.20
 prometheus-client==0.17.1
 python-dotenv==1.0.0
-pyarrow>=1.0.0
+pyarrow==14.0.2
