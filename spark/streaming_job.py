@@ -5,15 +5,13 @@ import logging
 import joblib
 import numpy as np
 import pandas as pd
-from datetime import datetime
 
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.types import (
     StructType, StructField,
     StringType, DoubleType,
-    IntegerType, LongType,
-    TimestampType
+    IntegerType
 )
 from pyspark.sql.functions import pandas_udf, col
 
@@ -69,9 +67,33 @@ POSTGRES_DB        = os.getenv('POSTGRES_DB', 'fraud_detection')
 POSTGRES_USER      = os.getenv('POSTGRES_USER', 'fraud_user')
 POSTGRES_PASSWORD  = os.getenv('POSTGRES_PASSWORD', 'fraud_pass')
 
-# ── FEATURE COLUMNS ───────────────────────────────────────────
-V_FEATURES   = [f'V{i}' for i in range(1, 29)]
-ALL_FEATURES = ['Time'] + V_FEATURES + ['Amount'] # 30 features
+# ── FEATURE CONTRACT ──────────────────────────────────────────
+# Single source of truth = metadata.json written by model/train.py.
+# Hardcoded list is only a fallback for local runs without artifacts.
+METADATA_PATH = os.getenv('METADATA_PATH', '/model/metadata.json')
+
+V_FEATURES         = [f'V{i}' for i in range(1, 29)]
+_FALLBACK_FEATURES = ['Time'] + V_FEATURES + ['Amount']   # creditcard.csv order
+_FALLBACK_SCALED   = ['Amount', 'Time']
+
+
+def load_feature_contract(path: str):
+    """Read feature order + scaled columns from training metadata."""
+    try:
+        with open(path) as f:
+            meta = json.load(f)
+        features = list(meta['features'])
+        scaled   = list(meta.get('scaled_features', _FALLBACK_SCALED))
+        log.info(f"📜 Feature contract loaded from {path} "
+                 f"({len(features)} features, scaled={scaled})")
+        return features, scaled
+    except (FileNotFoundError, KeyError, json.JSONDecodeError) as e:
+        log.warning(f"⚠️  Could not read contract from {path} ({e}). "
+                    f"Using hardcoded fallback.")
+        return _FALLBACK_FEATURES, _FALLBACK_SCALED
+
+
+ALL_FEATURES, SCALED_FEATURES = load_feature_contract(METADATA_PATH)
 
 # ── PROMETHEUS METRICS ────────────────────────────────────────
 transactions_processed = Counter(
@@ -82,20 +104,15 @@ fraud_detected = Counter(
     'spark_fraud_detected_total',
     'Total fraud transactions detected'
 )
-inference_duration = Histogram(
-    'spark_inference_duration_seconds',
-    'Time to run ML inference on a batch',
-    buckets=[.001, .005, .01, .025, .05, .1, .25, .5, 1.0]
+batch_processing_time = Histogram(
+    'spark_batch_processing_time_seconds',
+    'Total time to process one micro-batch',
+    buckets=[.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 7.5, 10.0]
 )
 batch_size_metric = Histogram(
     'spark_batch_size_transactions',
     'Number of transactions per micro-batch',
     buckets=[1, 5, 10, 50, 100, 500, 1000, 5000]
-)
-batch_processing_time = Histogram(
-    'spark_batch_processing_time_seconds',
-    'Total time to process one micro-batch',
-    buckets=[.1, .5, 1.0, 2.5, 5.0, 10.0, 30.0]
 )
 fraud_score_distribution = Histogram(
     'spark_fraud_score_distribution',
@@ -114,6 +131,11 @@ kafka_alert_errors = Counter(
     'spark_kafka_alert_errors_total',
     'Total Kafka alert send errors'
 )
+inference_duration = Histogram(
+    'spark_inference_duration_seconds',
+    'Time to materialize + score a batch (read + UDF inference)',
+    buckets=[.25, .5, .75, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 10.0]
+)
 
 
 # ════════════════════════════════════════════════════════════════
@@ -121,9 +143,10 @@ kafka_alert_errors = Counter(
 # ════════════════════════════════════════════════════════════════
 class ModelManager:
     """
-    Loads and manages the ML model.
-    Used on the driver to load model once,
-    then contents are broadcast to workers.
+    Loads model + scaler on the driver and validates them against
+    the feature contract BEFORE anything is broadcast to workers.
+    Fails at startup with a readable message instead of killing
+    the stream mid-batch (train/serve skew guard).
     """
 
     def __init__(self, model_path: str, scaler_path: str):
@@ -133,12 +156,48 @@ class ModelManager:
         self._scaler     = None
 
     def load(self):
-        """Load model and scaler from disk"""
         log.info(f"🤖 Loading model from {self.model_path}")
         self._model  = joblib.load(self.model_path)
         self._scaler = joblib.load(self.scaler_path)
-        log.info("✅ Model loaded successfully")
+
+        self._validate_contract()
+
+        # One thread per Spark task; Spark provides the parallelism.
+        # Avoids XGBoost oversubscribing cores across 3 concurrent tasks.
+        self._model.set_params(n_jobs=1)
+
+        log.info("✅ Model loaded and contract validated")
         return self
+
+    def _validate_contract(self):
+        errors = []
+
+        # Guard 1: scaler was fitted on exactly the columns we scale, same order
+        fitted_scaler = list(getattr(self._scaler, 'feature_names_in_', []))
+        if fitted_scaler != SCALED_FEATURES:
+            errors.append(
+                f"Scaler fitted on {fitted_scaler}, "
+                f"pipeline scales {SCALED_FEATURES}"
+            )
+
+        # Guard 2: model feature order == contract order
+        booster_names = list(self._model.get_booster().feature_names or [])
+        if booster_names != ALL_FEATURES:
+            errors.append(
+                f"Feature order mismatch\n"
+                f"      model   : {booster_names}\n"
+                f"      contract: {ALL_FEATURES}"
+            )
+
+        # Guard 3: sanity on contract size
+        if len(ALL_FEATURES) != 30:
+            errors.append(f"Contract has {len(ALL_FEATURES)} features, expected 30")
+
+        if errors:
+            raise RuntimeError(
+                "❌ Model contract validation failed — retrain with model/train.py:\n  - "
+                + "\n  - ".join(errors)
+            )
 
 
 # ════════════════════════════════════════════════════════════════
@@ -426,6 +485,13 @@ def create_spark_session() -> SparkSession:
 # ════════════════════════════════════════════════════════════════
 # PANDAS UDF FACTORY
 # ════════════════════════════════════════════════════════════════
+def score_features(features: pd.DataFrame, model, scaler) -> np.ndarray:
+    """Pure pandas scoring — used by the UDF and by unit tests."""
+    features = features.copy()
+    features[SCALED_FEATURES] = scaler.transform(features[SCALED_FEATURES])
+    return model.predict_proba(features[ALL_FEATURES])[:, 1]
+
+
 def make_fraud_udf(model_broadcast):
     """
     Returns a Pandas UDF that runs XGBoost inference.
@@ -472,16 +538,14 @@ def make_fraud_udf(model_broadcast):
             'V27'   : v27,    'V28'   : v28,
         })
 
-        # Fix: scale both columns together with one transform
-        features[['Amount', 'Time']] = scaler.transform(
-            features[['Amount', 'Time']]
-        )
+        # # Fix: scale both columns together with one transform
+        # features[SCALED_FEATURES] = scaler.transform(features[SCALED_FEATURES])
 
-        probabilities = model.predict_proba(
-            features[ALL_FEATURES]
-        )[:, 1]
+        # probabilities = model.predict_proba(
+        #     features[ALL_FEATURES]
+        # )[:, 1]
 
-        return pd.Series(probabilities)
+        return pd.Series(score_features(features, model, scaler))
 
     return predict_fraud_proba
 
@@ -598,7 +662,9 @@ def process_batch_udf(batch_df, batch_id: int,
         return
 
     # Small collect to driver — only for I/O, not for inference
+    inference_start = time.time()
     pdf        = batch_df.toPandas()
+    inference_duration.observe(time.time() - inference_start)
     batch_size = len(pdf)
 
     fraud_count = int(pdf['is_fraud_predicted'].sum())
@@ -702,6 +768,8 @@ def main():
 
     # ── CREATE SPARK SESSION ──────────────────────────────────
     spark = create_spark_session()
+    
+    model_manager._model.set_params(n_jobs=1)   # one thread per task; Spark handles parallelism
 
     # ── BROADCAST MODEL TO ALL WORKERS ───────────────────────
     # Sent once from driver → cached on each worker in memory
