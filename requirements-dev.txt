@@ -48,5 +48,7 @@ ruff==0.4.4
 
 pyarrow==14.0.2
 
+mlflow==2.9.2
+
 # pip install -r requirements-dev.txt
 # echo "✅ Dependencies installed"

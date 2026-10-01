@@ -97,6 +97,7 @@ services:
       POSTGRES_PASSWORD: fraud_pass
     volumes:
       - postgres-data:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
     ports:
       - "5432:5432"
     healthcheck:
@@ -148,6 +149,8 @@ services:
         condition: service_healthy
       postgres:
         condition: service_healthy
+      mlflow:
+        condition: service_healthy
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       KAFKA_TOPIC_TRANSACTIONS: raw_transactions
@@ -162,6 +165,9 @@ services:
       POSTGRES_DB: fraud_detection
       POSTGRES_USER: fraud_user
       POSTGRES_PASSWORD: fraud_pass
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MLFLOW_MODEL_NAME: fraud-xgb
+      MLFLOW_MODEL_ALIAS: production
     volumes:
       - ./model:/model:ro
       - spark-checkpoints:/tmp/spark-checkpoints
@@ -230,6 +236,33 @@ services:
       - "3000:3000"     # Grafana UI
     restart: unless-stopped
 
+    # ── MLFLOW ──────────────────────────────────────────────────
+  mlflow:
+    build: ./mlflow
+    container_name: mlflow
+    networks:
+      - fraud-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: >
+      mlflow server
+      --backend-store-uri postgresql://fraud_user:fraud_pass@postgres:5432/mlflow
+      --artifacts-destination /mlartifacts
+      --serve-artifacts
+      --host 0.0.0.0 --port 5000
+    volumes:
+      - mlflow-artifacts:/mlartifacts
+    ports:
+      - "5000:5000"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:5000/health').read()\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+
 # Add to volumes section (at the bottom of file)
 volumes:
   zookeeper-data:
@@ -239,3 +272,4 @@ volumes:
   spark-checkpoints:
   prometheus-data:
   grafana-data:
+  mlflow-artifacts:

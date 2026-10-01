@@ -67,6 +67,11 @@ POSTGRES_DB        = os.getenv('POSTGRES_DB', 'fraud_detection')
 POSTGRES_USER      = os.getenv('POSTGRES_USER', 'fraud_user')
 POSTGRES_PASSWORD  = os.getenv('POSTGRES_PASSWORD', 'fraud_pass')
 
+## MLFLOW CONFIG
+MLFLOW_TRACKING_URI = os.getenv('MLFLOW_TRACKING_URI')          # None → local pkl
+MLFLOW_MODEL_NAME   = os.getenv('MLFLOW_MODEL_NAME', 'fraud-xgb')
+MLFLOW_MODEL_ALIAS  = os.getenv('MLFLOW_MODEL_ALIAS', 'production')
+
 # ── FEATURE CONTRACT ──────────────────────────────────────────
 # Single source of truth = metadata.json written by model/train.py.
 # Hardcoded list is only a fallback for local runs without artifacts.
@@ -136,69 +141,102 @@ inference_duration = Histogram(
     'Time to materialize + score a batch (read + UDF inference)',
     buckets=[.25, .5, .75, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 10.0]
 )
-
+model_info = Gauge(
+    'spark_model_info',
+    'Currently loaded model (value is always 1)',
+    ['source', 'name', 'version']
+)
 
 # ════════════════════════════════════════════════════════════════
 # MODEL MANAGER
 # ════════════════════════════════════════════════════════════════
 class ModelManager:
     """
-    Loads model + scaler on the driver and validates them against
-    the feature contract BEFORE anything is broadcast to workers.
-    Fails at startup with a readable message instead of killing
-    the stream mid-batch (train/serve skew guard).
+    Loads model + scaler + feature contract from ONE source:
+      - MLflow registry  models:/<name>@<alias>  (preferred)
+      - local /model/*.pkl + metadata.json         (fallback)
+    Validates the contract before anything is broadcast.
     """
 
-    def __init__(self, model_path: str, scaler_path: str):
-        self.model_path  = model_path
-        self.scaler_path = scaler_path
-        self._model      = None
-        self._scaler     = None
+    def __init__(self, model_path: str, scaler_path: str,
+                 metadata_path: str = METADATA_PATH):
+        self.model_path    = model_path
+        self.scaler_path   = scaler_path
+        self.metadata_path = metadata_path
+        self._model  = None
+        self._scaler = None
+        self.features = None
+        self.scaled   = None
+        self.source   = None
+        self.version  = None
 
-    def load(self):
-        log.info(f"🤖 Loading model from {self.model_path}")
+    # ── loaders ───────────────────────────────────────────────
+    def _load_from_mlflow(self):
+        import mlflow
+        from mlflow import MlflowClient
+
+        mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+        client = MlflowClient()
+        mv = client.get_model_version_by_alias(MLFLOW_MODEL_NAME, MLFLOW_MODEL_ALIAS)
+        log.info(f"🤖 MLflow: {MLFLOW_MODEL_NAME} v{mv.version} "
+                 f"(@{MLFLOW_MODEL_ALIAS}, run {mv.run_id[:8]})")
+
+        self._model = mlflow.sklearn.load_model(
+            f"models:/{MLFLOW_MODEL_NAME}@{MLFLOW_MODEL_ALIAS}")
+
+        # scaler + metadata logged in the same run → download from that run
+        local = mlflow.artifacts.download_artifacts(
+            run_id=mv.run_id, dst_path='/tmp/mlflow-artifacts')
+        self._scaler = joblib.load(os.path.join(local, 'scaler.pkl'))
+        with open(os.path.join(local, 'metadata.json')) as f:
+            meta = json.load(f)
+
+        self.features = list(meta['features'])
+        self.scaled   = list(meta['scaled_features'])
+        self.source, self.version = 'mlflow', str(mv.version)
+
+    def _load_from_disk(self):
+        log.info(f"🤖 Local: {self.model_path}")
         self._model  = joblib.load(self.model_path)
         self._scaler = joblib.load(self.scaler_path)
+        self.features, self.scaled = load_feature_contract(self.metadata_path)
+        self.source, self.version = 'local', 'pkl'
+
+    def load(self):
+        if MLFLOW_TRACKING_URI:
+            try:
+                self._load_from_mlflow()
+            except Exception as e:
+                log.warning(f"⚠️  MLflow load failed ({e}); falling back to local artifacts")
+                self._load_from_disk()
+        else:
+            self._load_from_disk()
 
         self._validate_contract()
-
-        # One thread per Spark task; Spark provides the parallelism.
-        # Avoids XGBoost oversubscribing cores across 3 concurrent tasks.
         self._model.set_params(n_jobs=1)
-
-        log.info("✅ Model loaded and contract validated")
+        model_info.labels(self.source, MLFLOW_MODEL_NAME, self.version).set(1)
+        log.info(f"✅ Model ready — source={self.source} version={self.version} "
+                 f"features={len(self.features)} scaled={self.scaled}")
         return self
 
+    # ── contract guard ────────────────────────────────────────
     def _validate_contract(self):
         errors = []
+        fitted = list(getattr(self._scaler, 'feature_names_in_', []))
+        if fitted != self.scaled:
+            errors.append(f"Scaler fitted on {fitted}, contract scales {self.scaled}")
 
-        # Guard 1: scaler was fitted on exactly the columns we scale, same order
-        fitted_scaler = list(getattr(self._scaler, 'feature_names_in_', []))
-        if fitted_scaler != SCALED_FEATURES:
-            errors.append(
-                f"Scaler fitted on {fitted_scaler}, "
-                f"pipeline scales {SCALED_FEATURES}"
-            )
+        booster = list(self._model.get_booster().feature_names or [])
+        if booster != self.features:
+            errors.append(f"Feature order mismatch\n      model   : {booster}"
+                          f"\n      contract: {self.features}")
 
-        # Guard 2: model feature order == contract order
-        booster_names = list(self._model.get_booster().feature_names or [])
-        if booster_names != ALL_FEATURES:
-            errors.append(
-                f"Feature order mismatch\n"
-                f"      model   : {booster_names}\n"
-                f"      contract: {ALL_FEATURES}"
-            )
-
-        # Guard 3: sanity on contract size
-        if len(ALL_FEATURES) != 30:
-            errors.append(f"Contract has {len(ALL_FEATURES)} features, expected 30")
+        if len(self.features) != 30:
+            errors.append(f"Contract has {len(self.features)} features, expected 30")
 
         if errors:
             raise RuntimeError(
-                "❌ Model contract validation failed — retrain with model/train.py:\n  - "
-                + "\n  - ".join(errors)
-            )
-
+                "❌ Model contract validation failed:\n  - " + "\n  - ".join(errors))
 
 # ════════════════════════════════════════════════════════════════
 # DATABASE MANAGER
@@ -485,11 +523,13 @@ def create_spark_session() -> SparkSession:
 # ════════════════════════════════════════════════════════════════
 # PANDAS UDF FACTORY
 # ════════════════════════════════════════════════════════════════
-def score_features(features: pd.DataFrame, model, scaler) -> np.ndarray:
-    """Pure pandas scoring — used by the UDF and by unit tests."""
+def score_features(features: pd.DataFrame, model, scaler,
+                   feature_order=None, scaled_cols=None) -> np.ndarray:
+    feature_order = feature_order or ALL_FEATURES
+    scaled_cols   = scaled_cols   or SCALED_FEATURES
     features = features.copy()
-    features[SCALED_FEATURES] = scaler.transform(features[SCALED_FEATURES])
-    return model.predict_proba(features[ALL_FEATURES])[:, 1]
+    features[scaled_cols] = scaler.transform(features[scaled_cols])
+    return model.predict_proba(features[feature_order])[:, 1]
 
 
 def make_fraud_udf(model_broadcast):
@@ -545,7 +585,11 @@ def make_fraud_udf(model_broadcast):
         #     features[ALL_FEATURES]
         # )[:, 1]
 
-        return pd.Series(score_features(features, model, scaler))
+        return pd.Series(score_features(
+            features, model, scaler,
+            model_broadcast.value['features'],
+            model_broadcast.value['scaled'],
+        ))
 
     return predict_fraud_proba
 
@@ -752,52 +796,44 @@ def main():
     log.info("FRAUD DETECTION STREAMING JOB STARTING")
     log.info("=" * 60)
 
-    # ── START PROMETHEUS ──────────────────────────────────────
-    start_http_server(PROMETHEUS_PORT)
-    log.info(f"📊 Prometheus metrics on port {PROMETHEUS_PORT}")
-
-    # ── LOAD MODEL ON DRIVER ──────────────────────────────────
+    # ── LOAD MODEL ON DRIVER (MLflow → fallback local) ───────
     model_manager = ModelManager(MODEL_PATH, SCALER_PATH).load()
 
-    # ── CONNECT TO POSTGRES ───────────────────────────────────
+    # ── CONNECT TO POSTGRES ──────────────────────────────────
     db_manager = DatabaseManager().connect()
     db_manager.create_tables()
 
-    # ── CONNECT ALERT PRODUCER ────────────────────────────────
+    # ── CONNECT ALERT PRODUCER ───────────────────────────────
     alert_producer = AlertProducer().connect()
 
-    # ── CREATE SPARK SESSION ──────────────────────────────────
+    # ── CREATE SPARK SESSION ─────────────────────────────────
     spark = create_spark_session()
-    
-    model_manager._model.set_params(n_jobs=1)   # one thread per task; Spark handles parallelism
 
-    # ── BROADCAST MODEL TO ALL WORKERS ───────────────────────
-    # Sent once from driver → cached on each worker in memory
-    # UDF reads from local cache, not from disk
+    # ── BROADCAST MODEL + CONTRACT ───────────────────────────
     model_broadcast = spark.sparkContext.broadcast({
-        'model' : model_manager._model,
-        'scaler': model_manager._scaler,
+        'model'   : model_manager._model,
+        'scaler'  : model_manager._scaler,
+        'features': model_manager.features,
+        'scaled'  : model_manager.scaled,
     })
     log.info("📡 Model broadcast to all workers")
 
-    # ── BUILD + START STREAMING PIPELINE ─────────────────────
-    query = run_streaming_with_udf(
-        spark, model_broadcast, db_manager, alert_producer
-    )
+    # ── PROMETHEUS (start after everything is initialised) ───
+    start_http_server(PROMETHEUS_PORT)
+    log.info(f"📊 Prometheus metrics on port {PROMETHEUS_PORT}")
+
+    # ── START STREAMING ──────────────────────────────────────
+    query = run_streaming_with_udf(spark, model_broadcast, db_manager, alert_producer)
 
     log.info("🚀 Streaming query started")
     log.info(f"   Query ID : {query.id}")
-    log.info("   Waiting for data from Kafka...\n")
 
-    # ── WAIT FOR TERMINATION ──────────────────────────────────
     try:
         query.awaitTermination()
     except KeyboardInterrupt:
-        log.info("\n⛔ Stopping streaming job...")
+        log.info("⛔ Stopping streaming job...")
         query.stop()
         spark.stop()
-        log.info("✅ Streaming job stopped cleanly")
-
 
 # ── ENTRY POINT ───────────────────────────────────────────────
 if __name__ == '__main__':

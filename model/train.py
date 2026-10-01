@@ -178,3 +178,68 @@ print("   Contract OK ✅")
 print(f"   Model saved  → {os.path.join(OUTPUT_DIR, 'fraud_model.pkl')}")
 print(f"   Scaler saved → {os.path.join(OUTPUT_DIR, 'scaler.pkl')}")
 print(f"   Metadata     → {os.path.join(OUTPUT_DIR, 'metadata.json')}")
+
+# ── 10. MLFLOW TRACKING + REGISTRY (optional) ─────────────────
+# Runs only when MLFLOW_TRACKING_URI is set. CI/tests keep working offline.
+MLFLOW_URI   = os.getenv('MLFLOW_TRACKING_URI')
+MODEL_NAME   = os.getenv('MLFLOW_MODEL_NAME', 'fraud-xgb')
+MODEL_ALIAS  = os.getenv('MLFLOW_MODEL_ALIAS', 'production')
+
+if MLFLOW_URI:
+    import mlflow
+    from mlflow import MlflowClient
+
+    mlflow.set_tracking_uri(MLFLOW_URI)
+    mlflow.set_experiment('fraud-detection')
+
+    with mlflow.start_run() as run:
+        mlflow.log_params({
+            'n_estimators'    : metadata['n_estimators'],
+            'max_depth'       : metadata['max_depth'],
+            'learning_rate'   : metadata['learning_rate'],
+            'scale_pos_weight': metadata['scale_pos_weight'],
+            'threshold'       : metadata['threshold'],
+            'train_size'      : metadata['train_size'],
+            'test_size'       : metadata['test_size'],
+        })
+        mlflow.log_metrics(metadata['metrics'])
+        mlflow.set_tags({'features_hash': str(hash(tuple(feature_cols))),
+                         'n_features': len(feature_cols)})
+
+        # scaler + contract travel WITH the model, same run
+        mlflow.log_artifact(os.path.join(OUTPUT_DIR, 'scaler.pkl'))
+        mlflow.log_artifact(os.path.join(OUTPUT_DIR, 'metadata.json'))
+
+        # sklearn flavor = pickles the exact XGBClassifier (feature_names preserved)
+        mlflow.sklearn.log_model(model, artifact_path='model',
+                                 registered_model_name=MODEL_NAME)
+        run_id = run.info.run_id
+
+    # ── promotion gate: only alias @production if not worse than current ──
+    client = MlflowClient()
+    new_version = max(
+        int(v.version) for v in client.search_model_versions(f"name='{MODEL_NAME}'")
+        if v.run_id == run_id
+    )
+    new_auc = metadata['metrics']['auc_roc']
+
+    try:
+        current = client.get_model_version_by_alias(MODEL_NAME, MODEL_ALIAS)
+        current_auc = client.get_run(current.run_id).data.metrics.get('auc_roc', 0.0)
+    except Exception:
+        current, current_auc = None, None
+
+    if current is None or new_auc >= current_auc:
+        client.set_registered_model_alias(MODEL_NAME, MODEL_ALIAS, str(new_version))
+        print(f"\n🚀 {MODEL_NAME} v{new_version} → @{MODEL_ALIAS} "
+              f"(AUC {new_auc}"
+              + (f" ≥ previous {current_auc:.4f} v{current.version}" if current else ", first model")
+              + ")")
+    else:
+        print(f"\n⏸️  {MODEL_NAME} v{new_version} registered but NOT promoted: "
+              f"AUC {new_auc} < production v{current.version} ({current_auc:.4f})")
+
+    print(f"   Run: {MLFLOW_URI}/#/experiments/"
+          f"{mlflow.get_experiment_by_name('fraud-detection').experiment_id}/runs/{run_id}")
+else:
+    print("\nℹ️  MLFLOW_TRACKING_URI not set — skipped tracking/registry")
