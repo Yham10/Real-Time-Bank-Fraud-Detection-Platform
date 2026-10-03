@@ -36,6 +36,11 @@ scrape_configs:
         target_label: instance
         replacement: 'fraud-spark'
 
+  # ── DRIFT MONITOR METRICS ─────────────────────────────────
+  - job_name: 'drift-monitor'
+    static_configs:
+      - targets: ['drift-monitor:8002']
+
   # ── POSTGRESQL EXPORTER (OPTIONAL) ──────────────────────────
   # - job_name: 'postgres'
   #   static_configs:

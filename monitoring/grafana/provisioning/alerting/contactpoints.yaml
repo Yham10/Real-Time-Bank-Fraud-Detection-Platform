@@ -1,0 +1,10 @@
+apiVersion: 1
+contactPoints:
+  - orgId: 1
+    name: airflow-webhook
+    receivers:
+      - uid: airflow-webhook-receiver
+        type: webhook
+        settings:
+          url: http://drift-webhook:5005/grafana-webhook
+          httpMethod: POST

@@ -1,0 +1,69 @@
+apiVersion: 1
+groups:
+  - orgId: 1
+    name: model-drift
+    folder: Fraud Detection
+    interval: 1m
+    rules:
+      - uid: feature-drift-psi
+        title: Feature drift (PSI > 0.25)
+        condition: C
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: 'Max PSI {{ $values.B.Value }}'
+          description: 'Input shifted vs training reference. PSI={{ $values.B.Value }} threshold 0.25'
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              expr: drift_max_psi
+              instant: true
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: gt, params: [0.25] }
+
+      - uid: score-drift-psi
+        title: Prediction score drift (PSI > 0.25)
+        condition: C
+        for: 2m
+        labels: { severity: warning }
+        annotations:
+          summary: 'Score PSI {{ $values.B.Value }}'
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              expr: drift_score_psi
+              instant: true
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: gt, params: [0.25] }

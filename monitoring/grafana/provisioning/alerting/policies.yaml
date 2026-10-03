@@ -1,0 +1,11 @@
+apiVersion: 1
+policies:
+  - orgId: 1
+    receiver: grafana-default-email
+    group_by: ["grafana_folder", "alertname"]
+    routes:
+      - orgId: 1
+        receiver: airflow-webhook
+        object_matchers:
+          - ["severity", "=", "critical"]
+        continue: true

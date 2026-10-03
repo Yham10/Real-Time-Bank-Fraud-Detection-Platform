@@ -106,6 +106,15 @@ print(f"   FN: {cm[1,0]:5d}  TP: {cm[1,1]:5d}")
 print(f"\n   False Positive Rate: {cm[0,1]/(cm[0,0]+cm[0,1])*100:.2f}%")
 print(f"   False Negative Rate: {cm[1,0]/(cm[1,0]+cm[1,1])*100:.2f}%")
 
+# ── REFERENCE SAMPLE (for drift monitoring) ───────────────────
+# RAW (unscaled) features: same space as the Kafka messages.
+ref_idx   = X_test.sample(n=min(10_000, len(X_test)), random_state=42).index
+reference = df.loc[ref_idx, feature_cols].copy()
+reference['fraud_probability'] = model.predict_proba(X_test.loc[ref_idx])[:, 1]
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+reference.to_parquet(os.path.join(OUTPUT_DIR, 'reference_sample.parquet'), index=False)
+print(f"   Reference sample saved ({len(reference)} rows)")
+
 # ── 7. FEATURE IMPORTANCE ─────────────────────────────────────
 print("\nTop 10 Most Important Features:")
 importance = pd.DataFrame({
@@ -209,6 +218,7 @@ if MLFLOW_URI:
         # scaler + contract travel WITH the model, same run
         mlflow.log_artifact(os.path.join(OUTPUT_DIR, 'scaler.pkl'))
         mlflow.log_artifact(os.path.join(OUTPUT_DIR, 'metadata.json'))
+        mlflow.log_artifact(os.path.join(OUTPUT_DIR, 'reference_sample.parquet'))
 
         # sklearn flavor = pickles the exact XGBClassifier (feature_names preserved)
         mlflow.sklearn.log_model(model, artifact_path='model',
