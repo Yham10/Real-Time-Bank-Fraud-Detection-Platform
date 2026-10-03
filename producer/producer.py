@@ -108,10 +108,17 @@ def load_dataset(path):
     log.info(f"   Total: {len(df):,} | Fraud: {df['Class'].sum():,} ({df['Class'].mean()*100:.3f}%)")
     return df
 
-def build_message(row, transaction_id, drift_ctrl: DriftController):
-    # Apply drift on a copy
-    shifts = drift_ctrl.get_shifts() if drift_ctrl.is_enabled() else {}
-    scales = drift_ctrl.get_scales() if drift_ctrl.is_enabled() else {}
+def build_message(row, transaction_id, drift_ctrl=None):
+    shifts = {}
+    scales = {}
+    if drift_ctrl is not None:
+        try:
+            if drift_ctrl.is_enabled():
+                shifts = drift_ctrl.get_shifts() or {}
+                scales = drift_ctrl.get_scales() or {}
+        except Exception:
+            shifts = {}
+            scales = {}
 
     amount = float(row['Amount'])
     if 'Amount' in scales: amount *= float(scales['Amount'])
@@ -125,7 +132,7 @@ def build_message(row, transaction_id, drift_ctrl: DriftController):
         if k in shifts: v += float(shifts[k])
         v_values[k] = v
 
-    message = {
+    return {
         'transaction_id': f'TXN-{transaction_id:08d}',
         'timestamp': time.time(),
         'timestamp_iso': pd.Timestamp.now().isoformat(),
@@ -137,7 +144,6 @@ def build_message(row, transaction_id, drift_ctrl: DriftController):
         'card_last_four': f'{random.randint(1000, 9999)}',
         'country': random.choice(['US','UK','FR','DE','ES','IT','BR','AU','CA','JP']),
     }
-    return message
 
 def run_producer():
     start_http_server(PROMETHEUS_PORT)
