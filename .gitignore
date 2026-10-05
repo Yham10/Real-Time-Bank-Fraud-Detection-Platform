@@ -50,4 +50,9 @@ Thumbs.db
 
 echo "model/last_retrain.txt" >> .gitignore
 echo "airflow/logs/" >> .gitignore
-echo "__pycache__/" >> .gitignore
+echo "__pycache__/" >> .gitignoredvcstore/
+
+!data/*.dvc
+!model/*.dvc
+!data/
+!data/*.dvc

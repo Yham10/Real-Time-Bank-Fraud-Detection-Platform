@@ -19,6 +19,15 @@ import sklearn, xgboost
 from datetime import datetime, timezone
 from sklearn.metrics import precision_recall_fscore_support
 
+import hashlib
+
+def file_md5(path):
+    h = hashlib.md5()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(8192), b''):
+            h.update(chunk)
+    return h.hexdigest()[:12]
+
 print("=" * 60)
 print("FRAUD DETECTION MODEL TRAINING")
 print("=" * 60)
@@ -212,8 +221,12 @@ if MLFLOW_URI:
             'test_size'       : metadata['test_size'],
         })
         mlflow.log_metrics(metadata['metrics'])
-        mlflow.set_tags({'features_hash': str(hash(tuple(feature_cols))),
-                         'n_features': len(feature_cols)})
+        mlflow.set_tags({
+            'features_hash': hashlib.md5(",".join(feature_cols).encode()).hexdigest()[:12],
+            'data_hash': file_md5(DATA_PATH),
+            'dvc_data': open('data/creditcard.csv.dvc').read()[:200] if
+        os.path.exists('data/creditcard.csv.dvc') else 'no-dvc'
+        })
 
         # scaler + contract travel WITH the model, same run
         mlflow.log_artifact(os.path.join(OUTPUT_DIR, 'scaler.pkl'))

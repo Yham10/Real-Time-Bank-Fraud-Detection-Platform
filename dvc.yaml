@@ -1,0 +1,13 @@
+stages:
+  train:
+    cmd: python model/train.py
+    deps:
+      - model/train.py
+      - data/creditcard.csv
+    outs:
+      - model/fraud_model.pkl
+      - model/scaler.pkl
+      - model/reference_sample.parquet
+    metrics:
+      - model/metadata.json:
+          cache: false
