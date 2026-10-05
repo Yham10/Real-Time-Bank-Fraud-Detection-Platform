@@ -1,6 +1,6 @@
 {
   "model_type": "XGBClassifier",
-  "trained_at": "2026-10-04T23:47:45.539513+00:00",
+  "trained_at": "2026-10-05T14:13:04.575993+00:00",
   "features": [
     "Time",
     "V1",

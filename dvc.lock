@@ -9,8 +9,8 @@ stages:
       size: 150828752
     - path: model/train.py
       hash: md5
-      md5: e4c436af59b0543c900f9cddf6b2fd7d
-      size: 11297
+      md5: d1bc276bf833518ffc9ad57b8a8d2a70
+      size: 7508
     outs:
     - path: model/fraud_model.pkl
       hash: md5
@@ -18,7 +18,7 @@ stages:
       size: 318030
     - path: model/metadata.json
       hash: md5
-      md5: 4168769565168c37c62dd25984307c25
+      md5: 5029662fd03f5c0791257fb6353e4a6e
       size: 1005
     - path: model/reference_sample.parquet
       hash: md5
@@ -28,3 +28,7 @@ stages:
       hash: md5
       md5: 619e9e95abd6acbbecec8d6a0cde24ee
       size: 983
+    - path: model/shap_summary.png
+      hash: md5
+      md5: 96f46c677ead340c09764d37dab93220
+      size: 188838

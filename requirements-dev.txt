@@ -50,5 +50,8 @@ pyarrow==14.0.2
 
 mlflow==2.9.2
 
+shap==0.44.0
+matplotlib==3.8.2
+
 # pip install -r requirements-dev.txt
 # echo "✅ Dependencies installed"

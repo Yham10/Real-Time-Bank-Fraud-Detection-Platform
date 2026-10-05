@@ -1,3 +1,4 @@
 /fraud_model.pkl
 /scaler.pkl
 /reference_sample.parquet
+/shap_summary.png

@@ -8,6 +8,7 @@ stages:
       - model/fraud_model.pkl
       - model/scaler.pkl
       - model/reference_sample.parquet
+      - model/shap_summary.png
     metrics:
       - model/metadata.json:
           cache: false
