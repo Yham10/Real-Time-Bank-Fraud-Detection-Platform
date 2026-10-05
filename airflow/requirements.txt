@@ -5,3 +5,6 @@ pandas==2.1.4
 pyarrow==14.0.2
 psycopg2-binary==2.9.7
 requests==2.31.0
+
+shap==0.44.0
+matplotlib==3.8.2
