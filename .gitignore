@@ -56,3 +56,10 @@ echo "__pycache__/" >> .gitignoredvcstore/
 !model/*.dvc
 !data/
 !data/*.dvc
+
+dvcstore/
+
+model/last_retrain.txt
+airflow/logs/
+__pycache__/
+
