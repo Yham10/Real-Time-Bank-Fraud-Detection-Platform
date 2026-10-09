@@ -1,0 +1,13 @@
+apiVersion: 1
+datasources:
+  - name: Postgres
+    uid: postgres
+    type: postgres
+    url: postgres:5432
+    database: fraud_detection
+    user: fraud_user
+    secureJsonData:
+      password: fraud_pass
+    jsonData:
+      sslmode: disable
+      postgresVersion: 1500
