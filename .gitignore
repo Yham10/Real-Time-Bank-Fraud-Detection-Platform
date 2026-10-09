@@ -63,3 +63,12 @@ model/last_retrain.txt
 airflow/logs/
 __pycache__/
 
+"/creditcard.csv" | Set-Content data/.gitignore -Encoding utf8
+@"
+/fraud_model.pkl
+/scaler.pkl
+/reference_sample.parquet
+/shap_summary.png
+"@ | Set-Content model/.gitignore -Encoding utf8
+
+Get-Content model/.gitignore

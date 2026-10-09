@@ -1,8 +1,8 @@
 # 🔍 Real-Time Bank Fraud Detection Platform
 
-Streaming fraud scoring on **Kafka + Spark Structured Streaming** with **XGBoost as a distributed Pandas UDF**. Full observability with Prometheus + Grafana, drift detection with PSI, auto-retrain with Airflow + MLflow, persistence in PostgreSQL.
+Streaming fraud scoring on **Kafka + Spark Structured Streaming** with **XGBoost as a distributed Pandas UDF**. Full observability with Prometheus + Grafana, drift detection with PSI, auto-retrain with Airflow + MLflow, explainability with SHAP, data/model versioning with DVC, persistence in PostgreSQL.
 
-> Built to learn production ML systems: micro-batch inference, train/serve contract, pull-based metrics, Grafana-as-code, event-driven retraining.
+> Built to learn production ML systems: micro-batch inference, train/serve contract, pull-based metrics, Grafana-as-code, event-driven retraining, per-prediction explainability.
 
 ## Architecture
 
@@ -13,12 +13,16 @@ flowchart LR
   KafkaRaw --> Spark["Spark Structured Streaming<br/>Pandas UDF inference"]
   KafkaRaw --> Drift["drift-monitor<br/>deque 3000, PSI"]
   Spark --> PG[("Postgres<br/>transactions")]
+  Spark -- "prob >= 0.9" --> SHAP["SHAP TreeExplainer<br/>top_reasons, driver side"]
+  SHAP --> KafkaAlert
+  SHAP --> PG
   Spark --> KafkaAlert["fraud_alerts"]
   Spark --> Prom
   Producer --> Prom
   Drift --> Prom
   Drift -.->|"SELECT score"| PG
   Prom["Prometheus :9090<br/>scrapes /metrics"] --> Grafana["Grafana :3000<br/>dashboard + alerts"]
+  PG -.->|"top_reasons table"| Grafana
   Grafana -- "Firing" --> Webhook["drift-webhook :5005<br/>bridge"]
   Webhook -- "POST /dagRuns" --> Airflow["Airflow :8081<br/>retrain_on_drift"]
   Airflow -- "train.py" --> MLflow["MLflow :5000<br/>fraud-xgb@production"]
@@ -26,7 +30,7 @@ flowchart LR
   Airflow -- "docker restart" --> Drift
 ```
 
-**Why the model goes to the data:** the first version did `batch_df.toPandas()` on the driver and scored there, a single-machine bottleneck. Now the model is broadcast once and scored inside a `pandas_udf` on the executors. The driver only does I/O.
+**Why the model goes to the data:** the first version did `batch_df.toPandas()` on the driver and scored there, a single-machine bottleneck. Now the model is broadcast once and scored inside a `pandas_udf` on the executors. The driver only does I/O, metrics, alerting, and, for the small slice of high-confidence frauds, SHAP.
 
 ## Tech Stack
 
@@ -35,39 +39,47 @@ flowchart LR
 | Message bus | Kafka Confluent 7.5, 2 topics: `raw_transactions`, `fraud_alerts` |
 | Stream processing | Spark 3.4.1 Structured Streaming, Pandas UDF + broadcast, PyArrow 14 |
 | Model | XGBoost 2.0, scikit-learn 1.3, StandardScaler on Amount/Time |
+| Explainability | SHAP 0.44 (TreeExplainer), matplotlib 3.8.2 |
 | Drift | Custom PSI + KS, window 3000, reference 10k rows |
 | Tracking | MLflow 2.9.2 tracking + registry `models:/fraud-xgb@production` |
+| Data/model versioning | DVC, local remote `dvcstore/` (`dvc repro`, `dvc push`) |
 | Orchestration | Airflow 2.8.1-python3.10 (LocalExecutor) + `docker.sock` restart |
 | Metrics | Prometheus 2.47 (pull model), Grafana 10.2 (provisioned) |
 | Storage | Postgres 15: `transactions`, `batch_metrics`, `airflow`, `mlflow` |
 | Language | Python 3.10 |
 
-**Version pins:** Spark 3.4 needs pandas 1.5.3 / numpy 1.26 in the Spark image. The Airflow image must be `2.8.1-python3.10` because pandas 2.1.4 requires Python >= 3.9.
+**Version pins:** Spark 3.4 needs pandas 1.5.3 / numpy 1.26 in the Spark image. The Airflow image must be `2.8.1-python3.10` because pandas 2.1.4 requires Python >= 3.9. `shap==0.44.0` and `matplotlib==3.8.2` are pinned the same way across `requirements-dev.txt`, `spark/requirements.txt`, and `airflow/requirements.txt`.
 
 ## Project Structure
 
 ```text
 ├── docker-compose.yml
 ├── .env
-├── data/creditcard.csv
+├── dvc.yaml / dvc.lock           # train stage: deps=train.py+csv, outs=model artifacts, metrics=metadata.json
+├── dvcstore/                     # local DVC remote, `dvc push` target (gitignored, ~150MB of blobs)
+├── data/creditcard.csv (+ .dvc)
 ├── model/
-│   ├── train.py                  # saves model.pkl, scaler.pkl, metadata.json, reference_sample.parquet
+│   ├── train.py                  # saves model.pkl, scaler.pkl, metadata.json, reference_sample.parquet, shap_summary.png
 │   ├── metadata.json             # FEATURE CONTRACT + metrics, single source of truth
-│   └── reference_sample.parquet  # 10k random RAW rows + score (committed for now, DVC later)
+│   ├── reference_sample.parquet  # 10k random RAW rows + score (DVC-tracked)
+│   └── shap_summary.png          # global SHAP feature importance, logged to MLflow
 ├── producer/                     # producer.py, Dockerfile: random sampling + drift injection via /tmp/drift.json
-├── spark/                        # streaming_job.py: ModelManager, broadcast, UDF
+├── spark/                        # streaming_job.py: ModelManager, broadcast, UDF, SHAP explainer on driver
 ├── drift/                        # drift_math.py, monitor.py: pure PSI, window, reference reload
 ├── airflow/                      # Dockerfile (python3.10), requirements.txt, dags/retrain_on_drift.py
 ├── webhook-bridge/               # app.py: translates Grafana {alerts} -> Airflow {conf}
 ├── monitoring/
 │   ├── prometheus/prometheus.yml # scrape targets: producer:8000, spark:8001, drift-monitor:8002
 │   └── grafana/provisioning/
-│       ├── datasources/prometheus.yaml  # uid: prometheus (MUST match dashboard)
-│       ├── dashboards/                  # dashboards.yaml + fraud_dashboard.json
-│       └── alerting/                    # drift_rules.yaml, contactpoints.yaml, policies.yaml
+│       ├── datasources/
+│       │   ├── prometheus.yaml   # uid: prometheus (MUST match dashboard)
+│       │   └── postgres.yaml     # uid: postgres, used by the top_reasons table panel
+│       ├── dashboards/           # dashboards.yaml + fraud_dashboard.json
+│       └── alerting/             # drift_rules.yaml, contactpoints.yaml, policies.yaml
 ├── postgres/init/                # 01-mlflow-db.sql, 02-airflow-db.sql
 ├── tools/                        # psi_baseline_check.py: proves random 0.0065 vs sequential 1.32
-└── tests/                        # 12 tests: contract, scoring, producer schema, drift_math
+├── k8s/                          # k8s manifests (roadmap, in progress)
+└── tests/                        # 15 tests: contract, scoring, producer schema, drift_math, config files
 ```
 
 ## Quick Start
@@ -79,8 +91,10 @@ python -m venv venv
 .\venv\Scripts\activate
 pip install -r requirements-dev.txt
 
-# writes model/*.pkl + reference_sample.parquet, logs to MLflow if MLFLOW_TRACKING_URI is set
+# writes model/*.pkl + reference_sample.parquet + shap_summary.png, logs to MLflow if MLFLOW_TRACKING_URI is set
 python model/train.py
+# or, DVC-tracked:
+dvc repro
 
 docker compose up -d --build
 
@@ -117,7 +131,7 @@ docker logs -f fraud-spark
 ### Kafka
 
 - `raw_transactions`: 3 partitions, 24h retention. The producer writes; Spark and drift-monitor both read (fan-out via different consumer groups).
-- `fraud_alerts`: written by Spark.
+- `fraud_alerts`: written by Spark, including `top_reasons` for high-confidence fraud.
 - `__consumer_offsets`: internal.
 
 | Consumer | Group | Reads from | In Kafka UI? |
@@ -129,7 +143,21 @@ Spark **is** a Kafka consumer.
 
 ### Spark
 
-`readStream.format("kafka")` -> parse JSON with schema -> `pandas_udf` scores partitions in parallel -> `foreachBatch` handles metrics, alerts to `fraud_alerts`, and a Postgres upsert on `transaction_id`.
+`readStream.format("kafka")` -> parse JSON with schema -> `pandas_udf` scores partitions in parallel -> `foreachBatch` handles metrics, SHAP for high-confidence fraud, alerts to `fraud_alerts`, and a Postgres upsert on `transaction_id`.
+
+### Explainability (SHAP)
+
+Banks need "why did you flag this transaction?", not just a score.
+
+- **Training:** `model/train.py` samples 1000 test rows, runs `shap.TreeExplainer(model)`, and saves a global `shap_summary.png` (logged as an MLflow artifact). It shows `V14`, `V4`, `V12` as the top global drivers of fraud: the "why does the model work overall" view.
+- **Streaming:** only for high-confidence fraud, `fraud_probability >= 0.9`, not every transaction at 39.6 tps. `streaming_job.py` builds one `shap.TreeExplainer(model)` at startup (driver-side, not broadcast, since it isn't called inside the `pandas_udf`). Inside `foreachBatch`, the batch is filtered to `prob >= 0.9` before SHAP runs, the top 3 features per row are extracted, and `top_reasons` is attached to:
+  - the Kafka `fraud_alerts` message: `{"top_reasons": {"V14": 6.07, "V17": -0.58, ...}}`
+  - `transactions.top_reasons` in Postgres (added via `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, so it's a safe migration on an existing DB)
+  - logs: `TXN-00465582 | Score: 0.9811 | Reasons: V14=6.073, V17=-0.577`
+- **Why gate on confidence:** at a 0.2% fraud rate and 39.6 tps that's ~0.08 fraud/sec, and high-confidence fraud is rarer still: roughly one SHAP call every ~30s, ~12ms each. Negligible next to the ~1.3s batch time, so latency stays low while every alert that matters gets an explanation.
+- **New metrics on `:8001`:** `spark_shap_explanations_total` (counter), `spark_shap_duration_seconds` (histogram, buckets up to 2s).
+
+> **Gotcha:** the Postgres table `fraud_alerts` is never written to. Only the Kafka topic `fraud_alerts` is. If you query Postgres expecting alert messages there, you'll find nothing; Kafka UI is the source of truth for alert payloads. Also, rows inserted before SHAP shipped have `top_reasons = NULL` forever, which is expected, not a bug.
 
 ### Drift monitor
 
@@ -155,12 +183,13 @@ Pull model. Each service calls `start_http_server(8000)` and increments counters
 
 ### Grafana
 
-Grafana never talks to the producer. It reads Prometheus through a datasource.
+Grafana never talks to the producer directly, and only talks to Postgres for one panel. Everything else is Prometheus.
 
 - `datasources/prometheus.yaml` must have `uid: prometheus`.
-- Every panel in the dashboard JSON must have `"datasource": {"uid": "prometheus"}`.
+- Every Prometheus-backed panel in the dashboard JSON must use `"datasource": {"uid": "prometheus"}`.
 - The old UID `PBFA97...` caused `Data source not found` and `No data`.
 - `dashboards.yaml` tells Grafana where the JSON lives.
+- `datasources/postgres.yaml` (`uid: postgres`) is used by exactly one panel: the **"Recent High-Confidence Frauds with Top Reasons"** table, which runs a raw SQL query against `transactions`. It's the only panel not backed by Prometheus, because `top_reasons` is a row-level value, not a time series.
 
 ### Alerting
 
@@ -181,7 +210,7 @@ Grafana sends `{"alerts": [{"status": "firing", "labels": {"severity": "critical
 
 1. `check_drift`: queries `PROM_URL/api/v1/query?query=drift_max_psi`. If `< 0.25` and not `force`, raises `AirflowSkipException` and all downstream tasks are skipped.
 2. `check_cooldown`: reads `model/last_retrain.txt` (20 min cooldown).
-3. `train`: runs `model/train.py`, producing a new MLflow version + new reference.
+3. `train`: runs `model/train.py`, producing a new MLflow version, a new reference sample, and a refreshed `shap_summary.png`.
 4. `mark_retrain_time`: writes the marker file.
 5. `deploy`: `docker restart fraud-spark drift-monitor` via `/var/run/docker.sock` (needs `user: "0:0"`).
 
@@ -192,6 +221,22 @@ python -c "import requests; requests.post('http://localhost:8081/api/v1/dags/ret
 ```
 
 > PowerShell `curl.exe -d "{\"conf\":...}"` fails due to quoting. Use Python.
+
+## Data & Model Versioning (DVC)
+
+`dvc.yaml` defines a single `train` stage:
+
+- **deps:** `model/train.py`, `data/creditcard.csv`
+- **outs:** `model/fraud_model.pkl`, `model/scaler.pkl`, `model/reference_sample.parquet`, `model/shap_summary.png`
+- **metrics:** `model/metadata.json` (`cache: false`, so it's tracked by git, not DVC)
+
+`dvc repro` re-runs `train.py` only if a dependency changed (hash mismatch against `dvc.lock`). `dvc push` copies the resulting blobs to the local remote `dvcstore/` (gitignored, ~150MB) instead of committing binaries to git. `data/creditcard.csv.dvc` is the pointer file checked into git for the dataset itself.
+
+```powershell
+dvc repro      # retrain if train.py or the dataset changed
+dvc push       # sync artifacts to dvcstore/
+dvc pull       # restore artifacts on a fresh clone
+```
 
 ## Demo
 
@@ -214,6 +259,11 @@ docker logs -f airflow-scheduler --tail 50
 
 # 3. Clear drift: back to ~0.02 / Normal after ~75s
 docker exec fraud-producer rm /tmp/drift.json
+
+# 4. Check explainability end-to-end
+docker logs fraud-spark --tail 50 | findstr "Reasons:"
+docker exec postgres psql -U fraud_user -d fraud_detection -c "SELECT transaction_id, fraud_probability, top_reasons FROM transactions WHERE top_reasons IS NOT NULL ORDER BY id DESC LIMIT 5;"
+# Kafka UI -> fraud_alerts topic -> messages should include "top_reasons"
 ```
 
 ## ML Model
@@ -230,6 +280,8 @@ Dataset: 284,807 transactions, 492 frauds (0.173%), 30 features. XGBoost with 10
 
 `is_fraud_ground_truth` is in the Kafka message for validation only; a real system wouldn't have labels at inference time.
 
+SHAP (`shap_summary.png`, logged to MLflow) confirms `V14`, `V4`, `V12` as the strongest global drivers of the fraud class, consistent with the per-transaction `top_reasons` seen in production alerts.
+
 ## Monitoring
 
 Grafana panels:
@@ -242,6 +294,13 @@ Grafana panels:
 - PSI bar gauge (`drift_psi`), max PSI timeseries with 0.25 threshold
 - Drifted features, score PSI, window size stats
 
+**Explainability (SHAP):**
+
+- `spark_shap_explanations_total` (stat)
+- SHAP rate: `rate(spark_shap_explanations_total[5m])`
+- SHAP latency P95/P50: `histogram_quantile(..., spark_shap_duration_seconds_bucket)`
+- Table (Postgres datasource): recent high-confidence frauds with `top_reasons`, amount, country, `processed_at`
+
 ## Performance (Docker Desktop, Windows)
 
 | Metric | Value |
@@ -250,6 +309,7 @@ Grafana panels:
 | Batch | ~420 rows / 5s |
 | Batch time | ~1.3s (P95 ~2s) |
 | Inference | < 10 ms |
+| SHAP (per high-confidence fraud) | ~12 ms |
 | End-to-end | 5-7s |
 | Recovery from checkpoint | 1-2 min |
 
@@ -258,7 +318,7 @@ Grafana panels:
 ```powershell
 Remove-Item Env:MLFLOW_TRACKING_URI -ErrorAction SilentlyContinue
 $env:PYTHONIOENCODING = "utf-8"
-pytest -q tests   # 12 passed
+pytest -q tests   # 15 passed
 
 docker compose down -v   # full reset: wipes kafka-data, checkpoints, DB
 ```
@@ -275,6 +335,9 @@ docker compose down -v   # full reset: wipes kafka-data, checkpoints, DB
 8. **PowerShell `echo >` redirected on the host, not the container**. Use `| docker exec -i ... cat >`.
 9. **Airflow Python 3.8 vs pandas 2.1.4 (needs >= 3.9)**. Use image `2.8.1-python3.10`.
 10. **DAG skipped at PSI 0.02 < 0.25**. Expected when there is no drift; use `force: true`.
+11. **Postgres `fraud_alerts` table queried for `top_reasons`, always empty.** That table is never written; the Kafka topic `fraud_alerts` is the real sink for alert payloads.
+12. **Old rows show `top_reasons = NULL`.** Expected: SHAP was added after they were inserted, and it only fires for `prob >= 0.9` anyway, so most rows (legit traffic) will always be NULL.
+13. **Grafana Postgres table panel empty after adding the datasource.** Either the volume is stale or the data predates the feature. Fix: `TRUNCATE transactions, batch_metrics, fraud_alerts;` then `docker compose restart fraud-spark`.
 
 ## Troubleshooting
 
@@ -283,6 +346,13 @@ docker compose down -v   # full reset: wipes kafka-data, checkpoints, DB
 - **DAG skipped:** `drift_max_psi` is < 0.25. Check with `curl.exe -s http://localhost:8002/metrics | findstr drift_max`.
 - **`WARN KAFKA-1894`:** known Spark 3.4 bug, safe to ignore, batches still flow.
 - **Airflow `Request body is not valid JSON`:** PowerShell quoting issue, use Python `requests`.
+- **`top_reasons` always NULL in Postgres:** confirm you're querying `transactions` (not expecting a `fraud_alerts` table; it doesn't get written), and that the row is recent with `fraud_probability >= 0.9`.
+- **SHAP table panel empty in Grafana:** truncate old data and restart Spark so new rows are inserted after SHAP is live:
+
+  ```powershell
+  docker exec postgres psql -U fraud_user -d fraud_detection -c "TRUNCATE transactions, batch_metrics, fraud_alerts;"
+  docker compose restart fraud-spark
+  ```
 
 ## Roadmap
 
@@ -291,8 +361,8 @@ docker compose down -v   # full reset: wipes kafka-data, checkpoints, DB
 - [x] Pandas UDF + broadcast (replaced `toPandas`)
 - [x] Drift monitoring (PSI) + Grafana alerts
 - [x] Airflow auto-retrain + webhook bridge
-- [ ] DVC for `data/creditcard.csv`, `model/`, `reference_sample.parquet`
-- [ ] SHAP explainability on `fraud_alerts`
+- [x] DVC for `data/creditcard.csv`, `model/`, `reference_sample.parquet`
+- [x] SHAP explainability on `fraud_alerts`
 - [ ] Train on recent Postgres data, not just the CSV, so the retrained model adapts
 - [ ] Kubernetes manifests, validated
 

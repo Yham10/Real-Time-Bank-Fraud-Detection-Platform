@@ -24,7 +24,7 @@
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "h": 8, "w": 6, "x": 6, "y": 1 },
       "fieldConfig": { "defaults": { "unit": "percent", "decimals": 3, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "orange", "value": 1 }, { "color": "red", "value": 5 }] } } },
-      "targets": [{ "expr": "spark_current_fraud_rate * 100", "refId": "A" }]
+      "targets": [{ "expr": "sum(increase(spark_fraud_detected_total[5m])) / sum(increase(spark_transactions_processed_total[5m])) * 100", "refId": "A" }]
     },
     {
       "id": 4, "title": "Transaction Throughput (produced vs processed)", "type": "timeseries",
@@ -40,9 +40,10 @@
       "id": 6, "title": "Fraud Detection Rate (detected vs ground truth)", "type": "timeseries",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 10 },
+      "fieldConfig": { "defaults": { "unit": "percent", "decimals": 2 } },
       "targets": [
-        { "expr": "rate(spark_fraud_detected_total[2m])", "legendFormat": "Fraud Detected (model)", "refId": "A" },
-        { "expr": "rate(producer_fraud_sent_total[2m])", "legendFormat": "Actual Fraud (ground truth)", "refId": "B" }
+        { "expr": "sum(increase(spark_fraud_detected_total[5m])) / sum(increase(spark_transactions_processed_total[5m])) * 100", "legendFormat": "Fraud Detected (model)", "refId": "A" },
+        { "expr": "sum(increase(producer_fraud_sent_total[5m])) / sum(increase(producer_transactions_sent_total[5m])) * 100", "legendFormat": "Actual Fraud (ground truth)", "refId": "B" }
       ]
     },
     {
@@ -117,6 +118,26 @@
       "gridPos": { "h": 8, "w": 6, "x": 18, "y": 35 },
       "fieldConfig": { "defaults": { "mappings": [{ "type": "value", "options": { "0": { "text": "OFF" }, "1": { "text": "ON" } } }], "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }] } } },
       "targets": [{ "expr": "producer_drift_injection_active", "refId": "A" }]
+    },
+
+        { "id": 17, "type": "row", "title": "EXPLAINABILITY (SHAP)", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 43 } },
+    {
+      "id": 18, "title": "SHAP Explanations Total", "type": "stat",
+      "datasource": { "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 44 },
+      "targets": [{ "expr": "spark_shap_explanations_total", "refId": "A" }]
+    },
+    {
+      "id": 19, "title": "SHAP Rate", "type": "timeseries",
+      "datasource": { "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 6, "x": 6, "y": 44 },
+      "targets": [{ "expr": "rate(spark_shap_explanations_total[5m])", "refId": "A" }]
+    },
+    {
+      "id": 20, "title": "SHAP Latency P95", "type": "timeseries",
+      "datasource": { "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 44 },
+      "targets": [{ "expr": "histogram_quantile(0.95, sum(rate(spark_shap_duration_seconds_bucket[5m])) by (le))", "refId": "A" }]
     }
   ]
 }
