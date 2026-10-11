@@ -340,7 +340,7 @@ Grafana panels:
 ```powershell
 Remove-Item Env:MLFLOW_TRACKING_URI -ErrorAction SilentlyContinue
 $env:PYTHONIOENCODING = "utf-8"
-pytest -q tests   # 15 passed
+pytest -q tests   # 20 passed
 
 docker compose down -v   # full reset: wipes kafka-data, checkpoints, DB
 ```
